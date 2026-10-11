@@ -1,0 +1,1062 @@
+from __future__ import annotations
+
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+import cv2
+import torch
+from ultralytics import YOLO
+
+from PySide6.QtCore import Qt, QThread, Signal, QRectF, QPointF, QUrl
+from PySide6.QtGui import QFont, QPixmap, QPainter, QPen, QBrush, QColor, QPolygonF, QDesktopServices
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+APP_DIR = Path(__file__).resolve().parent
+MODEL_PATH = APP_DIR / "yolo8n.pt"
+OUTPUT_DIR = APP_DIR / "outputs" / "ppe_gui"
+ZONES_PATH = APP_DIR / "zones.json"
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def is_video_file(path: Path) -> bool:
+    return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def extract_first_frame(video_path: Path, output_path: Path) -> Path:
+    """Extract one video frame for preview and zone editing."""
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            raise RuntimeError(
+                f"Tidak dapat membaca frame dari video:\n{video_path}\n"
+                "Pastikan format video didukung OpenCV dan file tidak rusak."
+            )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(output_path), frame):
+            raise RuntimeError(f"Gagal menyimpan frame referensi: {output_path}")
+        return output_path
+    finally:
+        capture.release()
+
+# Provisional thresholds based on the initial tests; validate against a labeled test set.
+CLASS_THRESHOLDS = {"person": 0.35, "helmet": 0.35, "safety-vest": 0.15}
+COLORS = {
+    "person": (65, 185, 85),
+    "helmet": (255, 190, 25),
+    "safety-vest": (205, 60, 205),
+    "uncertain": (0, 165, 255),
+    "zone": (40, 210, 250),
+    "white": (255, 255, 255),
+}
+
+
+def load_zones() -> list[dict]:
+    if not ZONES_PATH.is_file():
+        return []
+    try:
+        data = json.loads(ZONES_PATH.read_text(encoding="utf-8"))
+        zones = data.get("zones", []) if isinstance(data, dict) else data
+        if not isinstance(zones, list):
+            return []
+        valid = []
+        for zone in zones:
+            if not isinstance(zone, dict):
+                continue
+            points = zone.get("points", [])
+            required = zone.get("required_classes", [])
+            if len(points) < 3 or not isinstance(required, list):
+                continue
+            if not all(
+                isinstance(point, (list, tuple)) and len(point) == 2
+                and all(isinstance(v, (int, float)) and 0 <= v <= 1 for v in point)
+                for point in points
+            ):
+                continue
+            valid.append({
+                "name": str(zone.get("name", f"Zona {len(valid) + 1}")),
+                "points": [[float(p[0]), float(p[1])] for p in points],
+                "required_classes": [
+                    str(c) for c in required if c in ("helmet", "safety-vest")
+                ],
+            })
+        return valid
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return []
+
+
+def save_zones(zones: list[dict]) -> None:
+    payload = {"version": 1, "coordinate_system": "normalized_0_to_1", "zones": zones}
+    ZONES_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def box_coordinates(box) -> tuple[int, int, int, int]:
+    return tuple(int(round(v)) for v in box.xyxy[0].tolist())
+
+
+def box_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    x1, y1, x2, y2 = box
+    return (x1 + x2) / 2, (y1 + y2) / 2
+
+
+def iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1, ix2, iy2 = max(ax1, bx1), max(ay1, by1), min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    return inter / max(1, area_a + area_b - inter)
+
+
+def item_overlap(item_box: tuple[int, int, int, int], person_box: tuple[int, int, int, int]) -> float:
+    x1, y1, x2, y2 = item_box
+    px1, py1, px2, py2 = person_box
+    ix1, iy1, ix2, iy2 = max(x1, px1), max(y1, py1), min(x2, px2), min(y2, py2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    area = max(1, (x2 - x1) * (y2 - y1))
+    return inter / area
+
+
+def score_association(item_box: tuple[int, int, int, int], person_box: tuple[int, int, int, int], kind: str) -> float | None:
+    px1, py1, px2, py2 = person_box
+    width, height = max(1, px2 - px1), max(1, py2 - py1)
+    cx, cy = box_center(item_box)
+    xr, yr = (cx - px1) / width, (cy - py1) / height
+    if not -0.08 <= xr <= 1.08:
+        return None
+    overlap = item_overlap(item_box, person_box)
+    if overlap < 0.25:
+        return None
+    if kind == "helmet":
+        if not -0.08 <= yr <= 0.38:
+            return None
+        target_y = 0.16
+    else:
+        if not 0.12 <= yr <= 0.80:
+            return None
+        target_y = 0.48
+    return abs(xr - 0.5) + 1.5 * abs(yr - target_y) + 0.8 * (1.0 - overlap)
+
+
+def deduplicate(detections: list[dict], threshold: float = 0.70) -> list[dict]:
+    kept: list[dict] = []
+    for item in sorted(detections, key=lambda obj: obj["conf"], reverse=True):
+        if all(iou(item["box"], other["box"]) <= threshold for other in kept):
+            kept.append(item)
+    return kept
+
+
+def draw_label(image, text: str, x: int, y: int, color: tuple[int, int, int], scale: float = 0.45) -> None:
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 1
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    height, width = image.shape[:2]
+    x = max(0, min(int(x), max(0, width - tw - 8)))
+    top = max(0, min(int(y - th - baseline - 6), max(0, height - th - baseline - 6)))
+    cv2.rectangle(image, (x, top), (min(width - 1, x + tw + 8), top + th + baseline + 6), color, -1)
+    cv2.putText(image, text, (x + 4, top + th + 1), font, scale, COLORS["white"], thickness, cv2.LINE_AA)
+
+
+def build_associations(detections: dict[str, list[dict]]) -> list[dict]:
+    people = [{**item, "helmet": None, "safety-vest": None} for item in detections["person"]]
+    # This is a geometric heuristic; it does not track identity or guarantee correct matching.
+    for kind in ("helmet", "safety-vest"):
+        candidates: list[tuple[float, int, dict]] = []
+        for item in detections[kind]:
+            for person_index, person in enumerate(people):
+                score = score_association(item["box"], person["box"], kind)
+                if score is not None:
+                    candidates.append((score, person_index, item))
+        used_people: set[int] = set()
+        used_items: set[tuple[int, int, int, int]] = set()
+        for score, person_index, item in sorted(candidates, key=lambda c: c[0]):
+            key = tuple(item["box"])
+            if person_index in used_people or key in used_items:
+                continue
+            people[person_index][kind] = item
+            used_people.add(person_index)
+            used_items.add(key)
+    return people
+
+
+def polygon_for_zone(zone: dict, width: int, height: int) -> list[tuple[int, int]]:
+    return [(int(round(x * width)), int(round(y * height))) for x, y in zone["points"]]
+
+
+def point_inside_zone(point: tuple[float, float], zone: dict, width: int, height: int) -> bool:
+    polygon = polygon_for_zone(zone, width, height)
+    if len(polygon) < 3:
+        return False
+    poly = __import__("numpy").array(polygon, dtype="int32")
+    return cv2.pointPolygonTest(poly, (float(point[0]), float(point[1])), False) >= 0
+
+
+def render_detection_view(image, detections: dict[str, list[dict]]) -> None:
+    short = {"person": "P", "helmet": "H", "safety-vest": "V"}
+    for label in ("person", "helmet", "safety-vest"):
+        for item in detections[label]:
+            x1, y1, x2, y2 = item["box"]
+            color = COLORS[label]
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+            draw_label(image, f"{short[label]} {item['conf']:.2f}", x1, max(y1, y2 - 2), color, 0.42)
+
+
+def render_association_view(image, people: list[dict]) -> None:
+    for index, person in enumerate(people, start=1):
+        x1, y1, x2, y2 = person["box"]
+        has_h, has_v = person["helmet"] is not None, person["safety-vest"] is not None
+        color = COLORS["person"] if has_h and has_v else COLORS["uncertain"]
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+        track_id = person.get("track_id")
+        person_tag = f"T{track_id}" if track_id is not None else f"P{index}"
+        draw_label(image, f"{person_tag} H:{'F' if has_h else '?'} V:{'F' if has_v else '?'}", x1, y1, color, 0.40)
+        for kind in ("helmet", "safety-vest"):
+            item = person[kind]
+            if item is not None:
+                ax1, ay1, ax2, ay2 = item["box"]
+                cv2.rectangle(image, (ax1, ay1), (ax2, ay2), COLORS[kind], 2)
+
+
+def render_zone_view(image, detections: dict[str, list[dict]], people: list[dict], zones: list[dict]) -> list[str]:
+    height, width = image.shape[:2]
+    report_lines: list[str] = []
+    for idx, zone in enumerate(zones, start=1):
+        pts = polygon_for_zone(zone, width, height)
+        color = (40, 210, 250) if idx % 2 else (255, 170, 60)
+        polygon = __import__("numpy").array(pts, dtype="int32")
+        cv2.polylines(image, [polygon], True, color, 3, cv2.LINE_AA)
+        overlay = image.copy()
+        cv2.fillPoly(overlay, [polygon], color)
+        cv2.addWeighted(overlay, 0.09, image, 0.91, 0, image)
+        required_text = ", ".join("Helmet" if c == "helmet" else "Vest" for c in zone["required_classes"])
+        label_y = max(26, min(p[1] for p in pts) + 22)
+        draw_label(image, f"ZONE {zone['name']} | {required_text or 'no PPE rule'}", min(p[0] for p in pts), label_y, color, 0.48)
+
+    # Draw associated PPE boxes and worker status. Worker location uses bottom-centre point.
+    for idx, person in enumerate(people, start=1):
+        x1, y1, x2, y2 = person["box"]
+        foot = ((x1 + x2) / 2, max(y1, y2 - 1))
+        applicable = [zone for zone in zones if point_inside_zone(foot, zone, width, height)]
+        cv2.rectangle(image, (x1, y1), (x2, y2), COLORS["person"], 2)
+        track_id = person.get("track_id")
+        person_tag = f"T{track_id}" if track_id is not None else f"P{idx}"
+        if not applicable:
+            draw_label(image, f"{person_tag} OUTSIDE ZONE", x1, y1, (100, 100, 100), 0.40)
+            continue
+        fragments = []
+        for zone in applicable:
+            status_bits = []
+            missing = []
+            for kind in zone["required_classes"]:
+                found = person.get(kind) is not None
+                short = "H" if kind == "helmet" else "V"
+                status_bits.append(f"{short}:{'OK' if found else 'CHECK'}")
+                if not found:
+                    missing.append(short)
+            fragments.append(f"{zone['name']} " + " ".join(status_bits))
+            report_lines.append(
+                f"P{idx} in '{zone['name']}': "
+                + (", ".join(status_bits) if status_bits else "no PPE required")
+                + (" — review needed; absence of detection is not proof of violation" if missing else " — required PPE detections found")
+            )
+        label = f"{person_tag} " + " | ".join(fragments)
+        person_color = COLORS["uncertain"] if "CHECK" in label else COLORS["person"]
+        draw_label(image, label, x1, y1, person_color, 0.38)
+        for kind in ("helmet", "safety-vest"):
+            item = person.get(kind)
+            if item is not None:
+                ax1, ay1, ax2, ay2 = item["box"]
+                cv2.rectangle(image, (ax1, ay1), (ax2, ay2), COLORS[kind], 2)
+
+    return report_lines
+
+
+class ZoneCanvas(QWidget):
+    """Image canvas; clicks add normalized polygon vertices for the selected scene."""
+    def __init__(self, image_path: Path, zones: list[dict]) -> None:
+        super().__init__()
+        self.pixmap = QPixmap(str(image_path))
+        self.zones = zones
+        self.current_points: list[list[float]] = []
+        self.setMinimumSize(560, 330)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+
+    def image_rect(self) -> QRectF:
+        if self.pixmap.isNull():
+            return QRectF()
+        area = self.rect().adjusted(10, 10, -10, -10)
+        iw, ih = self.pixmap.width(), self.pixmap.height()
+        scale = min(area.width() / max(1, iw), area.height() / max(1, ih))
+        w, h = iw * scale, ih * scale
+        return QRectF(area.center().x() - w / 2, area.center().y() - h / 2, w, h)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#0b1220"))
+        rect = self.image_rect()
+        if not self.pixmap.isNull():
+            painter.drawPixmap(rect, self.pixmap, QRectF(self.pixmap.rect()))
+        palette = [QColor("#22d3ee"), QColor("#fb923c"), QColor("#a78bfa"), QColor("#34d399")]
+        for i, zone in enumerate(self.zones):
+            color = palette[i % len(palette)]
+            points = [QPointF(rect.x() + x * rect.width(), rect.y() + y * rect.height()) for x, y in zone["points"]]
+            if len(points) >= 3:
+                painter.setPen(QPen(color, 3))
+                painter.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 35)))
+                painter.drawPolygon(QPolygonF(points))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                if points:
+                    painter.drawText(points[0] + QPointF(4, -5), zone["name"])
+        if self.current_points:
+            points = [QPointF(rect.x() + x * rect.width(), rect.y() + y * rect.height()) for x, y in self.current_points]
+            painter.setPen(QPen(QColor("#facc15"), 2, Qt.PenStyle.DashLine))
+            painter.setBrush(QBrush(QColor("#facc15")))
+            for point in points:
+                painter.drawEllipse(point, 4, 4)
+            if len(points) > 1:
+                painter.drawPolyline(QPolygonF(points))
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton or self.pixmap.isNull():
+            return
+        rect = self.image_rect()
+        pos = event.position()
+        if not rect.contains(pos):
+            return
+        x = min(1.0, max(0.0, (pos.x() - rect.x()) / rect.width()))
+        y = min(1.0, max(0.0, (pos.y() - rect.y()) / rect.height()))
+        self.current_points.append([x, y])
+        self.update()
+
+    def clear_current(self) -> None:
+        self.current_points.clear()
+        self.update()
+
+
+class ZoneEditorDialog(QDialog):
+    def __init__(self, image_path: Path, initial_zones: list[dict], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Safety Zone Editor")
+        self.resize(1100, 720)
+        self.zones = [dict(z, points=[list(p) for p in z["points"]], required_classes=list(z["required_classes"])) for z in initial_zones]
+        root = QVBoxLayout(self)
+        heading = QLabel("Editor Safety Zone")
+        heading.setObjectName("heading")
+        instructions = QLabel(
+            "Klik minimal 3 titik pada gambar untuk membentuk poligon. Zona hanya cocok untuk sudut pandang kamera/scene yang sama."
+        )
+        instructions.setWordWrap(True)
+        instructions.setObjectName("subtitle")
+        root.addWidget(heading)
+        root.addWidget(instructions)
+
+        body = QHBoxLayout()
+        self.canvas = ZoneCanvas(image_path, self.zones)
+        body.addWidget(self.canvas, 3)
+        side = QVBoxLayout()
+        side.addWidget(QLabel("Zona tersimpan"))
+        self.zone_list = QListWidget()
+        side.addWidget(self.zone_list, 1)
+        form = QFormLayout()
+        self.name_edit = QLineEdit(f"Zona {len(self.zones) + 1}")
+        form.addRow("Nama zona:", self.name_edit)
+        side.addLayout(form)
+        side.addWidget(QLabel("APD wajib di zona baru:"))
+        self.helmet_check = QCheckBox("Helm keselamatan")
+        self.vest_check = QCheckBox("Rompi keselamatan")
+        self.helmet_check.setChecked(True)
+        self.vest_check.setChecked(True)
+        side.addWidget(self.helmet_check)
+        side.addWidget(self.vest_check)
+        self.add_zone_button = QPushButton("Tambahkan Zona dari Titik")
+        self.clear_points_button = QPushButton("Hapus Titik Baru")
+        self.delete_zone_button = QPushButton("Hapus Zona Terpilih")
+        self.save_button = QPushButton("Simpan Zona & Tutup")
+        self.add_zone_button.setObjectName("runButton")
+        side.addWidget(self.add_zone_button)
+        side.addWidget(self.clear_points_button)
+        side.addWidget(self.delete_zone_button)
+        side.addStretch(1)
+        side.addWidget(self.save_button)
+        body.addLayout(side, 1)
+        root.addLayout(body, 1)
+
+        self.add_zone_button.clicked.connect(self.add_zone)
+        self.clear_points_button.clicked.connect(self.canvas.clear_current)
+        self.delete_zone_button.clicked.connect(self.delete_zone)
+        self.save_button.clicked.connect(self.save_and_close)
+        self._refresh_zone_list()
+
+    def _refresh_zone_list(self) -> None:
+        self.zone_list.clear()
+        for zone in self.zones:
+            required = ", ".join(zone["required_classes"]) or "tidak ada"
+            self.zone_list.addItem(QListWidgetItem(f"{zone['name']} — wajib: {required}"))
+        self.canvas.zones = self.zones
+        self.canvas.update()
+
+    def add_zone(self) -> None:
+        points = list(self.canvas.current_points)
+        if len(points) < 3:
+            QMessageBox.information(self, "Titik belum cukup", "Klik minimal 3 titik pada gambar untuk membentuk zona.")
+            return
+        required = []
+        if self.helmet_check.isChecked():
+            required.append("helmet")
+        if self.vest_check.isChecked():
+            required.append("safety-vest")
+        if not required:
+            QMessageBox.information(self, "Pilih APD", "Pilih minimal satu jenis APD wajib.")
+            return
+        name = self.name_edit.text().strip() or f"Zona {len(self.zones) + 1}"
+        if any(z["name"].casefold() == name.casefold() for z in self.zones):
+            QMessageBox.information(self, "Nama zona sudah ada", "Gunakan nama zona yang berbeda.")
+            return
+        self.zones.append({"name": name, "points": points, "required_classes": required})
+        self.canvas.clear_current()
+        self.name_edit.setText(f"Zona {len(self.zones) + 1}")
+        self._refresh_zone_list()
+
+    def delete_zone(self) -> None:
+        index = self.zone_list.currentRow()
+        if index < 0:
+            return
+        del self.zones[index]
+        self._refresh_zone_list()
+
+    def save_and_close(self) -> None:
+        try:
+            save_zones(self.zones)
+        except OSError as exc:
+            QMessageBox.critical(self, "Gagal menyimpan", f"Tidak dapat menyimpan konfigurasi zona:\n{exc}")
+            return
+        self.accept()
+
+
+class AnalysisWorker(QThread):
+    completed = Signal(str, str, str)  # output path, report, preview image path
+    failed = Signal(str)
+    status = Signal(str)
+
+    def __init__(self, media_path: Path, mode: str, zones: list[dict]) -> None:
+        super().__init__()
+        self.media_path = media_path
+        self.mode = mode
+        self.zones = zones
+
+    def _load_model(self):
+        if not MODEL_PATH.is_file():
+            raise FileNotFoundError(
+                f"Model tidak ditemukan:\n{MODEL_PATH}\n"
+                "Letakkan yolo8n.pt di folder yang sama dengan app_v5.py."
+            )
+        device = 0 if torch.cuda.is_available() else "cpu"
+        device_name = torch.cuda.get_device_name(0) if device == 0 else "CPU"
+        self.status.emit(f"Memuat model pada {device_name}...")
+        model = YOLO(str(MODEL_PATH))
+        names = model.names
+        class_ids = [idx for idx, name in names.items()
+                     if str(name).lower() in CLASS_THRESHOLDS]
+        if not class_ids:
+            raise RuntimeError(
+                "Model tidak memiliki kelas person, helmet, atau safety-vest."
+            )
+        return model, names, class_ids, device, device_name
+
+    def _infer_frame(self, model, names, class_ids, device, frame, tracking: bool = False):
+        """Infer PPE and optionally track people only.
+
+        Tracking only the person class avoids creating unrelated tracker tracks
+        for helmets and vests. PPE is detected separately and associated to people
+        with the existing geometric heuristic. Track IDs are temporary video
+        track labels, not verified worker identities.
+        """
+        detections: dict[str, list[dict]] = {
+            key: [] for key in CLASS_THRESHOLDS
+        }
+
+        if tracking:
+            person_ids = [
+                idx for idx, name in names.items()
+                if str(name).lower() == "person"
+            ]
+            ppe_ids = [
+                idx for idx, name in names.items()
+                if str(name).lower() in ("helmet", "safety-vest")
+            ]
+            if not person_ids:
+                raise RuntimeError("Model tidak memiliki kelas person.")
+
+            # Increase lost-track buffer to tolerate brief occlusion, such as
+            # a forklift mast crossing the worker. Ultralytics uses this YAML
+            # for persistent ByteTrack state throughout the video.
+            tracker_config = APP_DIR / "bytetrack_factory.yaml"
+            if not tracker_config.exists():
+                tracker_config.write_text(
+                    "tracker_type: bytetrack\n"
+                    "track_high_thresh: 0.25\n"
+                    "track_low_thresh: 0.10\n"
+                    "new_track_thresh: 0.25\n"
+                    "track_buffer: 90\n"
+                    "match_thresh: 0.80\n"
+                    "fuse_score: True\n",
+                    encoding="utf-8",
+                )
+
+            person_result = model.track(
+                source=frame,
+                device=device,
+                imgsz=640,
+                conf=0.15,
+                iou=0.50,
+                classes=person_ids,
+                verbose=False,
+                persist=True,
+                tracker=str(tracker_config),
+            )[0]
+
+            ppe_result = None
+            if ppe_ids:
+                ppe_result = model.predict(
+                    source=frame,
+                    device=device,
+                    imgsz=640,
+                    conf=min(CLASS_THRESHOLDS.values()),
+                    iou=0.50,
+                    classes=ppe_ids,
+                    verbose=False,
+                )[0]
+
+            if person_result.boxes is not None:
+                for box in person_result.boxes:
+                    label = str(names[int(box.cls.item())]).lower()
+                    confidence = float(box.conf.item())
+                    if label != "person" or confidence < CLASS_THRESHOLDS["person"]:
+                        continue
+                    track_id = None
+                    try:
+                        if box.id is not None:
+                            track_id = int(box.id.item())
+                    except (AttributeError, RuntimeError, ValueError):
+                        track_id = None
+                    detections["person"].append({
+                        "box": box_coordinates(box),
+                        "conf": confidence,
+                        "track_id": track_id,
+                    })
+
+            if ppe_result is not None and ppe_result.boxes is not None:
+                for box in ppe_result.boxes:
+                    label = str(names[int(box.cls.item())]).lower()
+                    confidence = float(box.conf.item())
+                    if label not in ("helmet", "safety-vest"):
+                        continue
+                    if confidence < CLASS_THRESHOLDS[label]:
+                        continue
+                    detections[label].append({
+                        "box": box_coordinates(box),
+                        "conf": confidence,
+                        "track_id": None,
+                    })
+        else:
+            result = model.predict(
+                source=frame,
+                device=device,
+                imgsz=640,
+                conf=min(CLASS_THRESHOLDS.values()),
+                iou=0.50,
+                classes=class_ids,
+                verbose=False,
+            )[0]
+            if result.boxes is not None:
+                for box in result.boxes:
+                    label = str(names[int(box.cls.item())]).lower()
+                    confidence = float(box.conf.item())
+                    if label not in CLASS_THRESHOLDS:
+                        continue
+                    if confidence < CLASS_THRESHOLDS[label]:
+                        continue
+                    detections[label].append({
+                        "box": box_coordinates(box),
+                        "conf": confidence,
+                        "track_id": None,
+                    })
+
+        for label in detections:
+            detections[label] = deduplicate(detections[label], 0.70)
+        return detections
+
+    def _render_frame(self, frame, detections):
+        image = frame.copy()
+        people = build_associations(detections)
+        zone_lines: list[str] = []
+        if self.mode == "Asosiasi APD":
+            render_association_view(image, people)
+        elif self.mode == "Analisis Safety Zone":
+            zone_lines = render_zone_view(image, detections, people, self.zones)
+        else:
+            render_detection_view(image, detections)
+        return image, people, zone_lines
+
+    def run(self) -> None:
+        capture = None
+        writer = None
+        try:
+            if not self.media_path.is_file():
+                raise FileNotFoundError(f"Media tidak ditemukan:\n{self.media_path}")
+            model, names, class_ids, device, device_name = self._load_model()
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            safe_mode = {
+                "Deteksi Objek": "detection",
+                "Asosiasi APD": "association",
+                "Analisis Safety Zone": "zones",
+            }.get(self.mode, "analysis")
+
+            # Still-image analysis retains the same behaviour as app_v3.
+            if not is_video_file(self.media_path):
+                frame = cv2.imread(str(self.media_path))
+                if frame is None:
+                    raise RuntimeError(f"OpenCV tidak dapat membaca gambar:\n{self.media_path}")
+                self.status.emit(f"Menganalisis gambar pada {device_name}...")
+                detections = self._infer_frame(model, names, class_ids, device, frame)
+                annotated, people, zone_lines = self._render_frame(frame, detections)
+                output_path = OUTPUT_DIR / f"{self.media_path.stem}_{safe_mode}.jpg"
+                if not cv2.imwrite(str(output_path), annotated):
+                    raise RuntimeError(f"Gagal menyimpan hasil ke:\n{output_path}")
+                counts = Counter({label: len(items) for label, items in detections.items()})
+                lines = [
+                    "AI SAFETY MONITOR — HASIL ANALISIS",
+                    f"Model: {MODEL_PATH.name}", f"Device: {device_name}",
+                    f"Media: {self.media_path.name}", f"Mode: {self.mode}", "",
+                    "Ambang confidence sementara:", "  person: 0.35", "  helmet: 0.35",
+                    "  safety-vest: 0.15", "", "Ringkasan deteksi:",
+                    f"  Person: {counts['person']}", f"  Helmet: {counts['helmet']}",
+                    f"  Safety vest: {counts['safety-vest']}",
+                ]
+                if self.mode == "Asosiasi APD":
+                    lines.extend(["", "Asosiasi berdasarkan posisi kotak:"])
+                    for idx, person in enumerate(people, 1):
+                        lines.append(
+                            f"  P{idx}: Helmet={'FOUND' if person['helmet'] is not None else 'CHECK'}; "
+                            f"Vest={'FOUND' if person['safety-vest'] is not None else 'CHECK'}"
+                        )
+                elif self.mode == "Analisis Safety Zone":
+                    lines.extend(["", f"Zona dikonfigurasi: {len(self.zones)}"])
+                    for zone in self.zones:
+                        required = ", ".join(zone["required_classes"]) or "tidak ada"
+                        lines.append(f"  {zone['name']}: APD wajib = {required}")
+                    lines.extend(["", "Hasil pekerja dalam zona:"] + (zone_lines or [
+                        "  Tidak ada pekerja yang terdeteksi berada dalam zona yang dipetakan."
+                    ]))
+                lines.extend([
+                    "", "Peringatan: asosiasi adalah heuristik geometris sederhana.",
+                    "CHECK/belum terdeteksi bukan bukti pelanggaran SOP.",
+                    "Zona relatif hanya sesuai untuk sudut pandang kamera/scene yang sama.",
+                    f"Output: {output_path}",
+                ])
+                self.completed.emit(str(output_path), "\n".join(lines), str(output_path))
+                return
+
+            # Video analysis: process each frame, without persistent person tracking.
+            output_path = OUTPUT_DIR / f"{self.media_path.stem}_{safe_mode}.mp4"
+            preview_path = OUTPUT_DIR / f"{self.media_path.stem}_{safe_mode}_preview.jpg"
+            capture = cv2.VideoCapture(str(self.media_path))
+            if not capture.isOpened():
+                raise RuntimeError(
+                    f"Tidak dapat membuka video:\n{self.media_path}\n"
+                    "Coba MP4/H.264 atau AVI yang didukung OpenCV."
+                )
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+            if fps <= 0 or fps > 120:
+                fps = 25.0
+            declared_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            frame_count = 0
+            total_counts = Counter()
+            status_counts = Counter()
+            observed_person_tracks: set[int] = set()
+            preview_saved = False
+            output_size = None
+            writer = None
+            self.status.emit(f"Memproses video pada {device_name}...")
+
+            while True:
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    break
+                frame_count += 1
+                height, width = frame.shape[:2]
+                if writer is None:
+                    output_size = (width, height)
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(str(output_path), fourcc, fps, output_size)
+                    if not writer.isOpened():
+                        raise RuntimeError(
+                            "OpenCV tidak dapat membuat file video MP4. "
+                            "Coba file input lain atau periksa dukungan codec OpenCV."
+                        )
+                detections = self._infer_frame(
+                    model, names, class_ids, device, frame, tracking=True
+                )
+                for label, items in detections.items():
+                    total_counts[label] += len(items)
+                    if label == "person":
+                        for item in items:
+                            track_id = item.get("track_id")
+                            if track_id is not None:
+                                observed_person_tracks.add(track_id)
+                annotated, people, zone_lines = self._render_frame(frame, detections)
+                writer.write(annotated)
+                if not preview_saved:
+                    if not cv2.imwrite(str(preview_path), annotated):
+                        raise RuntimeError(f"Gagal menyimpan pratinjau video: {preview_path}")
+                    preview_saved = True
+
+                if self.mode == "Analisis Safety Zone":
+                    for line in zone_lines:
+                        if "H:CHECK" in line and "V:CHECK" in line:
+                            status_counts["helmet_and_vest_check"] += 1
+                        elif "H:CHECK" in line:
+                            status_counts["helmet_check"] += 1
+                        elif "V:CHECK" in line:
+                            status_counts["vest_check"] += 1
+                        else:
+                            status_counts["required_ppe_found"] += 1
+
+                if frame_count == 1 or frame_count % max(1, int(fps)) == 0:
+                    if declared_frames > 0:
+                        pct = min(100, int(frame_count * 100 / declared_frames))
+                        self.status.emit(
+                            f"Memproses video: {frame_count}/{declared_frames} frame ({pct}%)..."
+                        )
+                    else:
+                        self.status.emit(f"Memproses video: {frame_count} frame... ")
+
+            if frame_count == 0:
+                raise RuntimeError("Video terbuka, tetapi tidak ada frame yang bisa dibaca.")
+            lines = [
+                "AI SAFETY MONITOR — HASIL ANALISIS VIDEO",
+                f"Video: {self.media_path.name}", f"Mode: {self.mode}",
+                f"Model: {MODEL_PATH.name}", f"Device: {device_name}",
+                f"Frame diproses: {frame_count}", f"FPS keluaran: {fps:.2f}", "",
+                "Total deteksi lintas frame (bukan jumlah objek unik):",
+                f"  Person detections: {total_counts['person']}",
+                f"  Helmet detections: {total_counts['helmet']}",
+                f"  Safety vest detections: {total_counts['safety-vest']}",
+                f"  Person track IDs teramati (perkiraan, bukan orang unik): {len(observed_person_tracks)}",
+            ]
+            if self.mode == "Analisis Safety Zone":
+                lines.extend([
+                    "", f"Zona dikonfigurasi: {len(self.zones)}",
+                    "Ringkasan status pekerja-frame di zona (bukan identitas unik):",
+                    f"  Required PPE detections found: {status_counts['required_ppe_found']}",
+                    f"  Helmet CHECK: {status_counts['helmet_check']}",
+                    f"  Vest CHECK: {status_counts['vest_check']}",
+                    f"  Helmet dan vest CHECK: {status_counts['helmet_and_vest_check']}",
+                ])
+            lines.extend([
+                "", "Catatan: ByteTrack hanya melacak kelas person; helm dan rompi dideteksi terpisah.",
+                "Track buffer 90 frame membantu toleransi oklusi singkat, tetapi dapat memperlambat pemrosesan.",
+                "Jumlah track ID adalah perkiraan, bukan jumlah pekerja unik yang terverifikasi.",
+                "Track dapat terpecah/berganti ID saat tertutup, keluar frame, atau gagal terdeteksi.",
+                "Asosiasi APD adalah heuristik geometris. CHECK bukan bukti pelanggaran SOP.",
+                "Zona hanya cocok untuk sudut pandang kamera/scene yang sama.",
+                f"Video hasil: {output_path}", f"Pratinjau frame pertama: {preview_path}",
+            ])
+            self.completed.emit(str(output_path), "\n".join(lines), str(preview_path))
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+        finally:
+            if capture is not None:
+                capture.release()
+            if writer is not None:
+                writer.release()
+
+
+class ImagePreview(QLabel):
+    def __init__(self, placeholder: str) -> None:
+        super().__init__(placeholder)
+        self._pixmap: QPixmap | None = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(300, 260)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setObjectName("imagePreview")
+        self.setWordWrap(True)
+
+    def set_image(self, image_path: str | Path) -> None:
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            self._pixmap = None
+            self.setText(f"Gagal membuka gambar:\n{image_path}")
+            return
+        self._pixmap = pixmap
+        self._update_scaled_pixmap()
+
+    def clear_image(self, placeholder: str) -> None:
+        self._pixmap = None
+        self.setPixmap(QPixmap())
+        self.setText(placeholder)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_scaled_pixmap()
+
+    def _update_scaled_pixmap(self) -> None:
+        if self._pixmap is not None:
+            scaled = self._pixmap.scaled(self.contentsRect().size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.setPixmap(scaled)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("AI Safety Monitor")
+        self.resize(1400, 900)
+        self.setMinimumSize(1000, 700)
+        self.selected_image: Path | None = None  # selected image or video path
+        self.scene_reference: Path | None = None  # image used to draw normalized zones
+        self.last_output_path: Path | None = None
+        self.worker: AnalysisWorker | None = None
+        self.zones = load_zones()
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(12)
+        heading = QLabel("AI Safety Monitor")
+        heading.setObjectName("heading")
+        subtitle = QLabel("Prototype desktop · PPE image/video analysis, person-only tracking, and safety zones")
+        subtitle.setObjectName("subtitle")
+        layout.addWidget(heading)
+        layout.addWidget(subtitle)
+
+        controls = QHBoxLayout()
+        self.choose_button = QPushButton("Pilih Media")
+        self.choose_button.setObjectName("primaryButton")
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Deteksi Objek", "Asosiasi APD", "Analisis Safety Zone"])
+        self.mode_combo.setMinimumWidth(190)
+        self.zone_button = QPushButton("Editor Safety Zone")
+        self.zone_button.setObjectName("zoneButton")
+        self.run_button = QPushButton("Jalankan Analisis")
+        self.run_button.setObjectName("runButton")
+        self.run_button.setEnabled(False)
+        self.open_result_button = QPushButton("Buka Hasil")
+        self.open_result_button.setEnabled(False)
+        self.status_label = QLabel("Pilih gambar atau video untuk memulai.")
+        self.status_label.setObjectName("status")
+        controls.addWidget(self.choose_button)
+        controls.addWidget(QLabel("Mode:"))
+        controls.addWidget(self.mode_combo)
+        controls.addWidget(self.zone_button)
+        controls.addWidget(self.run_button)
+        controls.addWidget(self.open_result_button)
+        controls.addWidget(self.status_label, 1)
+        layout.addLayout(controls)
+
+        previews = QHBoxLayout()
+        previews.setSpacing(14)
+        original_column, result_column = QVBoxLayout(), QVBoxLayout()
+        original_title, result_title = QLabel("Media Asli / Frame Referensi"), QLabel("Hasil Analisis / Pratinjau Video")
+        original_title.setObjectName("sectionTitle")
+        result_title.setObjectName("sectionTitle")
+        self.original_preview = ImagePreview("Belum ada gambar dipilih")
+        self.result_preview = ImagePreview("Hasil analisis akan muncul di sini")
+        original_column.addWidget(original_title)
+        original_column.addWidget(self.original_preview, 1)
+        result_column.addWidget(result_title)
+        result_column.addWidget(self.result_preview, 1)
+        previews.addLayout(original_column, 1)
+        previews.addLayout(result_column, 1)
+        layout.addLayout(previews, 1)
+
+        report_title = QLabel("Ringkasan")
+        report_title.setObjectName("sectionTitle")
+        layout.addWidget(report_title)
+        self.report = QTextEdit()
+        self.report.setReadOnly(True)
+        self.report.setMinimumHeight(150)
+        self.report.setMaximumHeight(220)
+        self.report.setPlainText("Model: yolo8n.pt\nGPU digunakan jika CUDA tersedia.\n\nPilih gambar lalu jalankan analisis.")
+        layout.addWidget(self.report)
+        disclaimer = QLabel("CHECK/belum terdeteksi bukan bukti pelanggaran SOP. Safety zone cocok untuk sudut pandang kamera yang tetap.")
+        disclaimer.setObjectName("disclaimer")
+        layout.addWidget(disclaimer)
+
+        self.setCentralWidget(root)
+        self.choose_button.clicked.connect(self.choose_media)
+        self.open_result_button.clicked.connect(self.open_result)
+        self.zone_button.clicked.connect(self.open_zone_editor)
+        self.run_button.clicked.connect(self.run_analysis)
+        self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
+
+    def on_mode_changed(self, mode: str) -> None:
+        self.result_preview.clear_image(f"Tekan Jalankan Analisis untuk mode: {mode}")
+
+    def choose_media(self) -> None:
+        filters = (
+            "Media files (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff "
+            "*.mp4 *.avi *.mov *.mkv *.webm *.m4v);;"
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff);;"
+            "Videos (*.mp4 *.avi *.mov *.mkv *.webm *.m4v)"
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Pilih gambar atau video untuk dianalisis", str(APP_DIR), filters
+        )
+        if not file_path:
+            return
+        self.selected_image = Path(file_path)
+        self.last_output_path = None
+        self.open_result_button.setEnabled(False)
+        if is_video_file(self.selected_image):
+            try:
+                reference = OUTPUT_DIR / f"{self.selected_image.stem}_zone_reference.jpg"
+                self.scene_reference = extract_first_frame(self.selected_image, reference)
+            except Exception as exc:
+                self.selected_image = None
+                self.scene_reference = None
+                QMessageBox.critical(self, "Video tidak dapat dibaca", str(exc))
+                return
+            self.original_preview.set_image(self.scene_reference)
+            media_type = "Video"
+            detail = "Zona untuk video akan digambar dari frame pertama. Gunakan hanya video dari scene/kamera tetap yang sama."
+        else:
+            self.scene_reference = self.selected_image
+            self.original_preview.set_image(self.selected_image)
+            media_type = "Gambar"
+            detail = "Siap menjalankan analisis gambar."
+        self.result_preview.clear_image("Tekan Jalankan Analisis")
+        self.run_button.setEnabled(True)
+        self.status_label.setText(f"{media_type} dipilih: {self.selected_image.name}")
+        self.report.setPlainText(
+            f"{media_type}: {self.selected_image}\n"
+            f"Mode: {self.mode_combo.currentText()}\n\n{detail}"
+        )
+
+    def open_result(self) -> None:
+        if self.last_output_path is None or not self.last_output_path.is_file():
+            QMessageBox.information(self, "Hasil belum tersedia", "Jalankan analisis terlebih dahulu.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_output_path)))
+
+    def open_zone_editor(self) -> None:
+        if self.selected_image is None or self.scene_reference is None:
+            QMessageBox.information(self, "Pilih media", "Pilih gambar atau video terlebih dahulu.")
+            return
+        dialog = ZoneEditorDialog(self.scene_reference, self.zones, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.zones = load_zones()
+            self.status_label.setText(f"Konfigurasi tersimpan: {len(self.zones)} zona")
+            self.report.setPlainText(f"Zona tersimpan di:\n{ZONES_PATH}\nJumlah zona: {len(self.zones)}\n\nZona memakai koordinat relatif dan sebaiknya digunakan hanya dengan kamera/scene yang sama.")
+
+    def run_analysis(self) -> None:
+        if self.selected_image is None:
+            QMessageBox.information(self, "Pilih gambar", "Pilih gambar terlebih dahulu.")
+            return
+        mode = self.mode_combo.currentText()
+        if mode == "Analisis Safety Zone" and not self.zones:
+            answer = QMessageBox.question(self, "Belum ada zona", "Belum ada Safety Zone. Mau membuka editor zona sekarang?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if answer == QMessageBox.StandardButton.Yes:
+                self.open_zone_editor()
+            if not self.zones:
+                return
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.run_button.setEnabled(False)
+        self.open_result_button.setEnabled(False)
+        self.choose_button.setEnabled(False)
+        self.zone_button.setEnabled(False)
+        self.mode_combo.setEnabled(False)
+        self.status_label.setText("Menjalankan model...")
+        self.report.setPlainText("Analisis sedang berjalan. Tunggu hingga selesai...")
+        self.worker = AnalysisWorker(self.selected_image, mode, self.zones)
+        self.worker.status.connect(self.status_label.setText)
+        self.worker.completed.connect(self.on_analysis_completed)
+        self.worker.failed.connect(self.on_analysis_failed)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def on_analysis_completed(self, output_path: str, report: str, preview_path: str) -> None:
+        self.last_output_path = Path(output_path)
+        self.result_preview.set_image(preview_path)
+        self.open_result_button.setEnabled(self.last_output_path.is_file())
+        if is_video_file(self.selected_image) if self.selected_image is not None else False:
+            result_type = "Video selesai"
+        else:
+            result_type = "Selesai"
+        self.report.setPlainText(report)
+        self.status_label.setText(f"{result_type}: {output_path}")
+
+    def on_analysis_failed(self, message: str) -> None:
+        self.status_label.setText("Analisis gagal.")
+        self.report.setPlainText(message)
+        QMessageBox.critical(self, "Kesalahan analisis", message)
+
+    def on_worker_finished(self) -> None:
+        self.choose_button.setEnabled(True)
+        self.zone_button.setEnabled(True)
+        self.mode_combo.setEnabled(True)
+        self.run_button.setEnabled(self.selected_image is not None)
+        self.open_result_button.setEnabled(self.last_output_path is not None and self.last_output_path.is_file())
+        self.worker = None
+
+
+def apply_style(app: QApplication) -> None:
+    app.setStyle("Fusion")
+    app.setFont(QFont("Segoe UI", 10))
+    app.setStyleSheet(
+        "QMainWindow, QWidget { background: #111827; color: #e5e7eb; }"
+        "QLabel#heading { font-size: 27px; font-weight: 700; color: #f9fafb; }"
+        "QLabel#subtitle { color: #9ca3af; margin-bottom: 4px; }"
+        "QLabel#sectionTitle { font-size: 14px; font-weight: 650; color: #d1d5db; }"
+        "QLabel#status { color: #93c5fd; padding-left: 8px; }"
+        "QLabel#imagePreview { background: #0b1220; border: 1px solid #374151; border-radius: 8px; color: #9ca3af; padding: 8px; }"
+        "QLabel#disclaimer { color: #9ca3af; font-size: 9pt; }"
+        "QPushButton, QComboBox { background: #374151; color: #f9fafb; border: 1px solid #4b5563; padding: 8px 11px; border-radius: 7px; }"
+        "QPushButton:hover { background: #4b5563; }"
+        "QPushButton:disabled { background: #1f2937; color: #6b7280; }"
+        "QPushButton#primaryButton { background: #2563eb; border-color: #2563eb; font-weight: 600; }"
+        "QPushButton#runButton { background: #047857; border-color: #047857; font-weight: 600; }"
+        "QPushButton#zoneButton { background: #7c3aed; border-color: #7c3aed; font-weight: 600; }"
+        "QComboBox QAbstractItemView { background: #1f2937; color: #f9fafb; selection-background-color: #2563eb; }"
+        "QTextEdit, QListWidget, QLineEdit { background: #0b1220; border: 1px solid #374151; border-radius: 8px; padding: 7px; color: #d1d5db; }"
+        "QCheckBox { padding: 4px; }"
+    )
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    apply_style(app)
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
